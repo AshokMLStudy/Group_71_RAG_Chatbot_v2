@@ -7,13 +7,13 @@ Original file is located at
     https://colab.research.google.com/drive/1GWMWJle8qtPxqQ9Xv6wAGGEE-xRjnLF_
 """
 
-!pip install faiss-cpu rank_bm25 sentence-transformers transformers beautifulsoup4
-!pip install transformers[sentencepiece]  # Ensure sentencepiece is installed for tokenization
-!pip install pdfplumber
-!pip install streamlit
-!pip install torch
+# !pip install faiss-cpu rank_bm25 sentence-transformers transformers beautifulsoup4
+# !pip install transformers[sentencepiece]  # Ensure sentencepiece is installed for tokenization
+# !pip install pdfplumber
+# !pip install streamlit
+# !pip install torch
 
-!pip install --upgrade torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+# !pip install --upgrade torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
 import streamlit as st
 import numpy as np
