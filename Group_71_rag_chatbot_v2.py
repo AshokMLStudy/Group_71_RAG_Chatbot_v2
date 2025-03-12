@@ -159,7 +159,7 @@ if query:
     with st.spinner("Processing..."):
         try:
             answer, confidence = advanced_rag(query)
-            filtered_answer = guardrail_filter(answer)
+            filtered_answer = guardrail_filter(answer, query)
             st.write(f"Answer: {filtered_answer}")
             st.write(f"Confidence Score: {confidence:.2f}")
         except Exception as e:
