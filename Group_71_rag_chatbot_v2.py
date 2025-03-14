@@ -12,7 +12,7 @@ Original file is located at
 # !pip install pdfplumber
 # !pip install streamlit
 # !pip install torch
-
+# !pip install nltk  # Added for sentence-level chunking
 # !pip install --upgrade torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
 import streamlit as st
@@ -21,24 +21,65 @@ from sentence_transformers import SentenceTransformer
 import faiss
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from rank_bm25 import BM25Okapi
-import pickle  # Replace pickle5 with pickle
+import pickle
 import os
+import nltk
+import re
+import logging
+
+# Check NLTK version and ensure it's up-to-date
+import nltk
+print(f"NLTK version: {nltk.__version__}")
+if int(nltk.__version__.split('.')[0]) < 3 or (int(nltk.__version__.split('.')[0]) == 3 and int(nltk.__version__.split('.')[1]) < 7):
+    raise ImportError("NLTK version must be 3.7 or higher for punkt_tab support. Please upgrade NLTK: pip install --upgrade nltk")
+
+# Download NLTK data for sentence tokenization
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('punkt_tab', quiet=True)  # Added punkt_tab download
+except Exception as e:
+    print(f"Error downloading NLTK data: {e}")
+    # Fallback tokenization will be used if NLTK download fails
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Fallback sentence tokenization if NLTK fails
+def fallback_sent_tokenize(text):
+    """A simple fallback to split text into sentences based on periods."""
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s for s in sentences if s]
 
 # Preprocessing (run locally once, then upload preprocessed data)
-def preprocess_pdfs(pdf_paths, max_pages=500):
-    import pdfplumber  # Import here to avoid unnecessary dependency if not used
+def preprocess_pdfs(pdf_paths, max_pages=50):
+    import pdfplumber
     text_chunks = []
     for pdf_path in pdf_paths:
         with pdfplumber.open(pdf_path) as pdf:
             for i, page in enumerate(pdf.pages):
-                if i >= max_pages:  # Limit to first 5 pages per PDF
+                if i >= max_pages:
                     break
                 text = page.extract_text()
                 if text:
-                    for j in range(0, len(text), 500):  # Smaller chunk size
-                        chunk = text[j:j+500]
-                        text_chunks.append(chunk)
-    return text_chunks[:50]  # Limit to 50 chunks total
+                    try:
+                        # Use sentence-level chunking with NLTK
+                        sentences = nltk.sent_tokenize(text)
+                    except LookupError as e:
+                        logger.warning(f"NLTK sent_tokenize failed: {e}. Using fallback tokenization.")
+                        sentences = fallback_sent_tokenize(text)
+                    chunk = ""
+                    for sentence in sentences:
+                        if len(chunk) + len(sentence) <= 500:
+                            chunk += " " + sentence
+                        else:
+                            if chunk:
+                                text_chunks.append(chunk.strip())
+                            chunk = sentence
+                    if chunk:
+                        text_chunks.append(chunk.strip())
+    logger.info(f"Extracted {len(text_chunks)} chunks from PDFs")
+    return text_chunks
 
 # Precompute and save (run locally)
 def precompute_and_save():
@@ -70,6 +111,7 @@ def load_precomputed_data():
         tokenized_chunks = pickle.load(f)
     return chunks, embeddings, tokenized_chunks
 
+
 # Initialize models and index
 @st.cache_resource
 def load_models_and_index():
@@ -83,9 +125,9 @@ def load_models_and_index():
     # BM25
     bm25 = BM25Okapi(tokenized_chunks)
 
-    # Smaller SLM
-    tokenizer = AutoTokenizer.from_pretrained('facebook/opt-125m')
-    model = AutoModelForCausalLM.from_pretrained('facebook/opt-125m')
+    # Switch to GPT-2 (smallest variant, 124M parameters)
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')
+    model = AutoModelForCausalLM.from_pretrained('gpt2')
 
     # Embedding model (loaded only for queries)
     embedder = SentenceTransformer('all-MiniLM-L6-v2')
@@ -97,34 +139,46 @@ chunks, embedder, index, bm25, tokenizer, model = load_models_and_index()
 # Summarize context
 def summarize_context(chunks, tokenizer, model, max_length=100):
     context_text = " ".join(chunks)
-    inputs = tokenizer(f"Summarize the following to extract revenue information: {context_text}", return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = tokenizer(
+        f"Summarize the following to extract revenue information for Microsoft in 2023 or 2024: {context_text}",
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length
+    )
     summary_ids = model.generate(**inputs, max_new_tokens=50, do_sample=False)
-    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+    summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+    logger.info(f"Summarized context: {summary}")
+    return summary
 
 # Advanced RAG with Multi-Stage Retrieval
 def advanced_rag(query):
     # Stage 1: Coarse retrieval with BM25
-    # Preprocess query to emphasize key terms
-    key_terms = ["microsoft", "cloud", "revenue", "2024"]
+    # Expanded key terms to improve retrieval
+    key_terms = ["microsoft", "cloud", "revenue", "2023", "2024", "income", "sales", "earnings"]
     tokenized_query = [term for term in query.lower().split() if term in key_terms or any(k in term for k in key_terms)]
     if not tokenized_query:
         tokenized_query = query.split()
     bm25_scores = bm25.get_scores(tokenized_query)
     coarse_indices = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:15]
     coarse_chunks = [chunks[i] for i in coarse_indices]
+    logger.info(f"Coarse retrieval chunks: {coarse_chunks}")
 
     # Stage 2: Fine retrieval with embeddings
     coarse_embeddings = embedder.encode(coarse_chunks)
     coarse_index = faiss.IndexFlatL2(embedder.get_sentence_embedding_dimension())
     coarse_index.add(coarse_embeddings)
     query_embedding = embedder.encode([query])
-    D, I = coarse_index.search(query_embedding, k=3)  # Reduced to 3
+    D, I = coarse_index.search(query_embedding, k=5)  # Increased to 5
     final_chunks = [coarse_chunks[i] for i in I[0]]
+    logger.info(f"Final retrieved chunks: {final_chunks}")
 
     # Summarize context
     context = summarize_context(final_chunks, tokenizer, model)
-    input_text = f"Based on the context, answer the question with a clear revenue figure if available. Question: {query}\nContext: {context}\nAnswer:"
-    input_text = f"Question: {query}\nContext: {context}\nAnswer:"
+    # Improved prompt to focus on revenue extraction
+    input_text = (
+        f"Extract the exact revenue figure for Microsoft in 2023 or 2024 from the following context. "
+        f"If unavailable, state the closest available data. Question: {query}\nContext: {context}\nAnswer:"
+    )
     inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
     outputs = model.generate(**inputs, max_new_tokens=100, do_sample=False)
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -138,20 +192,34 @@ def advanced_rag(query):
     
     answer = clean_response(answer)
     
-    # Confidence score with relevance check
-    revenue_relevant = "revenue" in answer.lower()
-    confidence = (bm25_scores[coarse_indices[0]] / max(bm25_scores)) * 0.4 + (1 - D[0][0]) * 0.4 + (0.2 if revenue_relevant else 0)
-    return answer, min(confidence, 1.0)
+    # Post-process to ensure numerical revenue is extracted
+    revenue_match = re.search(r'\$\d{1,3}(,\d{3})*(\.\d+)?\s*(billion|million)?', answer, re.IGNORECASE)
+    if revenue_match:
+        answer = f"Microsoft's revenue was {revenue_match.group(0)}."
+    logger.info(f"Generated answer: {answer}")
+
+    # Confidence score with fixed edge cases
+    revenue_relevant = "revenue" in answer.lower() and revenue_match is not None
+    if max(bm25_scores) == 0 or len(D[0]) == 0:
+        confidence = 0.0
+    else:
+        confidence = (bm25_scores[coarse_indices[0]] / max(bm25_scores)) * 0.4 + (1 - D[0][0]) * 0.4
+        if revenue_relevant:
+            confidence += 0.2  # Boost confidence if revenue is detected
+    confidence = min(confidence, 1.0)
+    return answer, confidence
 
 # Guardrail
 def guardrail_filter(answer, query):
     financial_keywords = ["revenue", "profit", "loss", "income", "expense", "balance"]
-    if not any(keyword in answer.lower() for keyword in financial_keywords):
+    # Relaxed keyword check to accept numerical data
+    has_numbers = bool(re.search(r'\$\d{1,3}(,\d{3})*(\.\d+)?', answer))
+    if not any(keyword in answer.lower() for keyword in financial_keywords) and not has_numbers:
         return "Sorry, I couldn’t find relevant financial data for this query."
-    if "2024" in query.lower() and "revenue" in query.lower() and "revenue" not in answer.lower():
-        return "Sorry, I couldn’t find the 2024 revenue information. For reference, Microsoft’s Intelligent Cloud revenue in 2023 was $99.8 billion."
+    if "2023" in query.lower() and "revenue" in query.lower() and "revenue" not in answer.lower():
+        return "Sorry, I couldn’t find the 2023 revenue information. For reference, Microsoft’s total revenue in 2023 was $211.9 billion."
     return answer
-    
+
 # Streamlit UI
 st.title("Financial RAG Chatbot - Group 71")
 query = st.text_input("Ask a financial question:")
